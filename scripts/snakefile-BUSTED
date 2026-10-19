@@ -1,0 +1,99 @@
+######################
+## Helper Functions ##
+######################
+def get_list(filename):
+    """extract a list of files to be analyzed, provided in FILENAME"""
+    my_list = []
+    with open(filename, 'r') as data_in:
+        for line in data_in:
+            my_list.append(line.strip())
+    return(my_list)
+
+###################
+## Configuration ##
+###################
+configfile: "config-BUSTED.yaml"
+
+# Config file should specify:
+# # - dataDirectory: Full path to the directory containing the folder of codon-aware gene alignments and the folder of trees.
+# # - resultDirectory: Full path to the directory in which to place the folder of BUSTED results
+# # - np: Number of processes for MPI.
+NP = config['np']
+dataDirectory = config['dataDirectory']
+resultDirectory = config['resultDirectory']
+
+MSAs = glob_wildcards(os.path.join(dataDirectory, "post_msa", "{file}.msa")).file
+FILES = glob_wildcards(os.path.join(dataDirectory, "raxml", "{file}.msa.raxml.bestTree")).file
+
+################
+## HYPHY vars ##
+################
+# hyphy = "/home/hverdonk/hyphy-develop/hyphy"
+# hyphy = "/usr/local/bin/hyphy"
+HYPHYMP = "/home/hverdonk/hyphy-develop/HYPHYMP"
+HYPHYMPI = "/home/hverdonk/hyphy-develop/HYPHYMPI"
+LIBPATH = "/home/hverdonk/hyphy-develop/res"
+
+
+## Helper Functions ##
+######################
+# handle the case where some file names are different, due to filtering
+def format_input(wildcards):
+    curr_file = [f for f in MSAs if wildcards.file in f]
+    if 'FILTER' in curr_file[0]:
+        return resultDirectory + "/post_msa/" + curr_file[0] + ".msa"
+    else:
+        return resultDirectory + "/post_msa/" + wildcards.file + ".msa"
+
+
+
+##################
+## BEGIN SCRIPT ##
+##################
+print("Files are: ", FILES)
+
+rule all:
+    input:
+        expand(os.path.join(resultDirectory, "BUSTED", "{GENE}.BUSTED.json"), GENE = FILES),
+
+rule busted:
+    input:
+        seq = format_input,
+        tree = os.path.join(dataDirectory, "raxml", "{file}.msa.raxml.bestTree")
+    output:
+        json = os.path.join(resultDirectory, "BUSTED", "{file}.BUSTED.json"),
+        fits = os.path.join(resultDirectory, "BUSTED", "{file}-fit.lf")
+    log:
+        stdout="slurm-logs/out/BUSTED.{file}.out",
+        stderr="slurm-logs/err/BUSTED.{file}.err"
+    threads: NP
+    resources:
+        tasks=NP,                  # SLURM --ntasks (MPI ranks)
+        nodes=1,                   # SLURM --nodes
+        cpus_per_task=1,           # SLURM --cpus-per-task (per rank)
+        mem_mb=4000,
+        runtime=120,
+        mpi="srun",
+    shell:
+        """
+        module load hyphy
+
+        mkdir -p {resultDirectory}/BUSTED
+        
+#        {resources.mpi} --mpi=pmix \
+#        --ntasks {resources.tasks} \
+#        --cpus-per-task {resources.cpus_per_task} \
+#        {HYPHYMPI} LIBPATH={LIBPATH} busted  # TODO: ADD BACKSLASH HERE AND REPLACE --srv Yes
+
+        hyphy busted \
+        --alignment {input.seq} \
+        --tree {input.tree} \
+        --starting-points 5 \
+        --srv No \
+        --error-sink Yes \
+        --output {output.json} \
+        --save-fit {output.fits} > \
+        {log.stdout} 2> \
+        {log.stderr}
+        """
+

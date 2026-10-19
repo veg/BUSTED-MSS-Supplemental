@@ -1,0 +1,147 @@
+import subprocess
+
+######################
+## Helper Functions ##
+######################
+def get_list(filename):
+    """extract a list of files to be analyzed, provided in FILENAME"""
+    my_list = []
+    with open(filename, 'r') as data_in:
+        for line in data_in:
+            my_list.append(line.strip())
+    return(my_list)
+
+###################
+## Configuration ##
+###################
+configfile: "config-BUSTED-MSS.yaml"
+
+# Config file should specify:
+# # - dataDirectory: Full path to the directory containing the folder of codon-aware gene alignments and the folder of trees.
+# # - resultDirectory: Full path to the directory in which to place the folder of BUSTED results
+# # - np: Number of processes for MPI.
+NP = config['np']
+dataDirectory = config['dataDirectory']
+resultDirectory = config['resultDirectory']
+mss_type = config['mss-type']
+mssFile = config['mss-file']
+
+FILES = glob_wildcards(resultDirectory + "/raxml/{file}.msa.raxml.bestTree").file
+MSAs = glob_wildcards(resultDirectory + "/post_msa/{file}.msa").file
+
+ARGS = "--mss-type "
+
+if mss_type == "Full":
+    ARGS += '"Full"'
+    
+elif mss_type == "SynREV":
+    print("Warning: SynREV is not currently supported for BUSTED+MSS and should be disabled.")
+    ARGS += '"SynREV"'
+    
+elif mss_type == "SynREV2":
+    ARGS += '"SynREV2"'
+    
+elif mss_type == "SynREV2g":
+    ARGS += '"SynREV2g"'
+    
+elif mss_type == "SynREVCodon":
+    # MSS rates must be estimated relative to each other (with a constrained mean of 1),
+    # rather than relative to dN (which is incompatible with the way BUSTED estimates rates)
+    ARGS += '"SynREVCodon" --mss-reference-rate "synonymous"'
+    
+elif mss_type == "Random":
+    if not mssClasses:
+        mssClasses = 2  # Default value
+    ARGS += '"Random" --mss-classes ' + str(mssClasses)
+    
+elif mss_type == "Empirical":
+    if not mssFile:
+        raise ValueError("For 'Empirical', --mss-file must be specified")
+    ARGS += '"Empirical" --mss-file ' + mssFile
+    
+elif mss_type == "File":
+    if not mssFile:
+        raise ValueError("For 'File', the path to the TSV partition file must be specified")
+    ARGS += '"File" --mss-file ' + mssFile + ' --mss-neutral "NEUTRAL"'
+    
+elif mss_type == "Codon-file":
+    if not mssFile:
+        raise ValueError("For 'Codon-file', the path to the TSV partition file must be specified")
+    ARGS += '"Codon-file" --mss-file ' + mssFile + ' --mss-neutral "NEUTRAL"'
+    
+else:
+    raise ValueError(f"Unknown mss_type: {mss_type}")
+
+
+################
+## HYPHY vars ##
+################
+# hyphy = "/home/hverdonk/hyphy-develop/hyphy"
+hyphy = "/usr/local/bin/hyphy"
+# HYPHYMP = "/home/hverdonk/hyphy-develop/HYPHYMP"
+# HYPHYMPI = "/home/hverdonk/hyphy-develop/HYPHYMPI"
+# LIBPATH = "/home/hverdonk/hyphy-develop/res"
+
+######################
+## Helper Functions ##
+######################
+# handle the case where some alignments have different file names, because they've been filtered
+def format_input(wildcards):
+    curr_file = [f for f in MSAs if wildcards.file in f]
+    if 'FILTER' in curr_file[0]:
+        return resultDirectory + "/post_msa/" + curr_file[0] + ".msa"
+    else:
+        return resultDirectory + "/post_msa/" + wildcards.file + ".msa"
+
+
+##################
+## BEGIN SCRIPT ##
+##################
+print("Files are: ", FILES)
+
+rule all:
+    input:
+        expand(os.path.join(resultDirectory, "BUSTED-MSS-" + mss_type, "{GENE}.BUSTED-MSS.json"), GENE = FILES),
+        expand(os.path.join(resultDirectory, "BUSTED-MSS-" + mss_type, "{GENE}.BUSTED-MSS-fit.lf"), GENE = FILES)
+
+rule busted:
+    input:
+        seq = format_input,
+        tree = os.path.join(dataDirectory, "raxml", "{file}.msa.raxml.bestTree")
+    output:
+        json = os.path.join(resultDirectory, "BUSTED-MSS-" + mss_type, "{file}.BUSTED-MSS.json"),
+        fits = os.path.join(resultDirectory, "BUSTED-MSS-" + mss_type, "{file}.BUSTED-MSS-fit.lf")
+    threads: NP
+    resources:
+        tasks=NP,                  # SLURM --ntasks (MPI ranks)
+        nodes=1,                   # SLURM --nodes
+        cpus_per_task=1,           # SLURM --cpus-per-task (per rank)
+        mem_mb=4000,
+        runtime=120,
+        mpi="srun",
+    log: 
+        stdout="slurm-logs/out/bustedMSS.{file}.out",
+        stderr="slurm-logs/err/bustedMSS.{file}.err"
+    shell:
+        # LIBPATH={LIBPATH}
+        """
+        mkdir -p {resultDirectory}/BUSTED-MSS-{mss_type}
+
+#        {resources.mpi} --mpi=pmix \
+#        --ntasks {resources.tasks} \
+#        --cpus-per-task {resources.cpus_per_task}
+
+        {hyphy} busted \
+        --alignment {input.seq} \
+        --tree {input.tree} \
+        --mss Yes \
+        {ARGS} \
+        --starting-points 5 \
+        --srv No \
+        --error-sink Yes \
+        --output {output.json} \
+        --save-fit {output.fits} > \
+        {log.stdout} 2> \
+        {log.stderr}
+        """
+

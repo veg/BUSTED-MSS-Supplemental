@@ -1,0 +1,170 @@
+import os
+import shutil
+import json
+
+###################
+## Configuration ##
+###################
+with open('cluster-GA.json', 'r') as f:
+    data = json.loads(f.read())
+NODES = data['__default__']['nodes']
+PPN = data['__default__']['ppn']
+
+SUBSAMPLES = 1 # normally 10, formerly 25
+FILES_PER_SUBSAMPLE = 100 # for enterobacteria it's 1613 for alignments and 1594 for trees # normally 100
+CLASSES = 2 # how many classes to divide synonymous codon pairs into. Normally 2 (neutral and selected)
+# NOTE: simulated alignments can only have 2 classes at the moment, given the post-processing python script
+FULL_MODEL = True
+# FULL_MODEL=True: each codon gets it's own rate (codon model)
+# FULL_MODEL=False: all codons belonging to an amino acid share a rate (amino acid model)
+
+##########
+## DATA ##
+##########
+# NEUTRAL_REF = "/data/shares/veg/hverdonk/neutral-sim.tsv"
+WORKDIR = "/data/shares/veg/hverdonk/jaltomata-MSS"
+OUTDIR = "/data/shares/veg/hverdonk/jaltomata-MSS/GA-results"
+OUTFILE = "20241021-jalto-codonGA-2class"
+GA_ALIGNMENTS = WORKDIR + "/GA-alignments"
+GA_SUBPATH = GA_ALIGNMENTS.replace("/data/shares/veg/hverdonk/", "")  # specifically for building the list of files for the GA
+MSAS = WORKDIR + "/post_msa"
+TREES = WORKDIR + "/raxml"
+dissenter_set = ""
+# CONDITION = os.listdir(MSAS)[0].split(".")[0]
+
+# GA always appends the current directory's full path onto the list of files it's given, 
+# so give relative filepath from the directory you run the snakemake file in to the GA alignments
+
+# FILES = glob_wildcards(WORKDIR + "/raxml" + dissenter_set + "/{file}.msa.raxml.bestTree").file
+FILES = glob_wildcards(WORKDIR + "/raxml" + dissenter_set + "/{file}.fa.nwk").file
+print("Files are " + str(FILES))
+print("There are %d files" % (len(FILES)))
+
+###########
+## TOOLS ##
+###########
+DATASET_BUILDER = "/data/shares/veg/hverdonk/python/build-GA-dataset.py"
+SUBSAMPLER = "/data/shares/veg/hverdonk/python/subsample.py"
+RESULT_CONVERTER_AA = "/data/shares/veg/hverdonk/MSS-results/GA/scripts/processor.bf"
+RESULT_CONVERTER_CODON = "/data/shares/veg/hverdonk/MSS-results/GA/scripts/processor-codon.bf"
+RESULT_PROCESSOR = "/data/shares/veg/hverdonk/python/process_GA_results.py"
+
+################
+## HYPHY vars ##
+################
+hyphy = "/usr/local/bin/hyphy"
+# HYPHYMP = "/home/hverdonk/hyphy-develop/HYPHYMP"
+# HYPHYMPI = "/home/hverdonk/hyphy-develop/HYPHYMPI"
+HYPHYMPI = "/usr/local/bin/HYPHYMPI"
+LIBPATH = "/home/hverdonk/hyphy-develop/res"
+GA_aminoacid = "/home/hverdonk/hyphy-develop/res/TemplateBatchFiles/MSS-selector.bf"
+GA_codon = "/home/hverdonk/hyphy-develop/res/TemplateBatchFiles/MSS-selector-2.bf"
+
+
+# Run GA using the BIC selection criterion
+
+rule all:
+    input:
+        # extra, for rebuilding GA-alignments
+        # expand(GA_ALIGNMENTS + "/{file}_with_raxml_bestTree.msa", file=FILES)
+        # uncomment if running the GA on empirical data
+        expand(OUTDIR + "/" + OUTFILE + "-subsamples/{subsmpl}.tsv", subsmpl=[OUTFILE + "-subsample" + str(n) for n in range(1, SUBSAMPLES + 1)])
+        # v1: expand(OUTDIR + "/" + OUTFILE + "-subsamples/" + OUTFILE + "-subsample{num}.tsv", num=list(range(1, SUBSAMPLES + 1)))
+        # uncomment if running the GA repeatedly on empirical data
+        # expand(OUTDIR + "/" + OUTFILE + "-replicates/" + OUTFILE + "-replicate{num}.tsv", num=list(range(1, 11)))
+        # uncomment if running the GA on simulated data
+        # OUTDIR + "/" + OUTFILE + ".csv"
+
+rule buildDataset:
+    # optional argument -n or --subset : prepare just n files for the GA, instead of all files in the folder
+    input: MSAS, TREES
+    output:
+        expand(GA_ALIGNMENTS + "/{file}_with_raxml_bestTree.msa", file=FILES) 
+        # directory(GA_ALIGNMENTS) # expand(GA_ALIGNMENTS + "/" + CONDITION + ".replicate.{rep}_with_raxml_bestTree.msa", rep=list(range(1,(SUBSAMPLES*FILES_PER_SUBSAMPLE) + 1))
+    shell:
+        """
+	mkdir -p {GA_ALIGNMENTS}
+	python3 {DATASET_BUILDER} --msa {MSAS} --trees {TREES} --outdir {GA_ALIGNMENTS}
+        """
+
+rule subsample:
+    input:
+        expand(GA_ALIGNMENTS + "/{file}_with_raxml_bestTree.msa", file=FILES) 
+        # directory(GA_ALIGNMENTS) # expand(GA_ALIGNMENTS + "/" + CONDITION + ".replicate.{rep}_with_raxml_bestTree.msa" +  , rep=list(range(1,(SUBSAMPLES*FILES_PER_SUBSAMPLE) + 1))
+    output: expand(WORKDIR + "/subsamples/" + OUTFILE + "-subsample{num}.txt", num=list(range(1,SUBSAMPLES + 1)))
+    shell:
+        """
+        mkdir -p {WORKDIR}/subsamples
+        python3 {SUBSAMPLER} --replicates {SUBSAMPLES} -n {FILES_PER_SUBSAMPLE} --dir {GA_SUBPATH} -o {WORKDIR}/subsamples/{OUTFILE}-subsample
+        """
+
+rule GA:
+    input:
+        # WORKDIR + "/subsamples/" + OUTFILE + "-subsample1.txt" # uncomment for a repeated GA run
+        WORKDIR + "/subsamples/{subsample}.txt"
+    output:
+        # uncomment to repeatedly run the GA on the same training data
+        # expand(OUTDIR + "/" + OUTFILE + "-replicates/" + OUTFILE + "-replicate{num}.json", num=list(range(1, 11)))
+        # uncomment to run the GA normally (on sampled replicates)
+        OUTDIR + "/" + OUTFILE + "-subsamples/{subsample}.json"
+    params: 
+        GA = {GA_codon} if FULL_MODEL else {GA_aminoacid}, 
+        FLAG = "--mss-type SynREVCodon" if FULL_MODEL else ""
+    threads: 
+        PPN
+    resources:
+        mem_mb=32000
+    shell:
+        """
+        # source /etc/profile.d/modules.sh
+        # module unload openmpi
+        # module load openmpi/gnu/4.1.0
+        mpirun -np {PPN} {HYPHYMPI} {params.GA} --ic BIC {params.FLAG} --classes {CLASSES} --filelist {input} --output {output}
+        """
+
+    # uncomment below to repeatedly run the GA on the same training data
+    # run:
+    #      for i in range(1, 11):
+    #          shell("mpirun -np 6 {HYPHYMPI} {params.GA} --ic BIC --filelist {input} --output {OUTDIR}/{OUTFILE}-replicates/{OUTFILE}-replicate" + str(i) + ".json")
+
+rule convert_results:
+    input:
+        # OUTDIR + "/" + OUTFILE + "-replicates/{replicate}.json" # uncomment to repeatedly run the GA on the same training data
+        OUTDIR + "/" + OUTFILE + "-subsamples/{subsample}.json"
+    output:
+        # OUTDIR + "/" + OUTFILE + "-replicates/{replicate}.tsv" # uncomment to repeatedly run the GA on the same training data
+        OUTDIR + "/" + OUTFILE + "-subsamples/{subsample}.tsv"
+    params:
+        GA = {RESULT_CONVERTER_CODON} if FULL_MODEL else {RESULT_CONVERTER_AA}
+    shell:
+        '''
+        {hyphy} {params.GA} --json {input} --tsv {output}
+        '''
+
+rule process_results:
+    input:
+        OUTDIR + "/" + OUTFILE + "-subsamples/" + OUTFILE + "-subsample{num}.tsv"
+        # expand(OUTDIR + "/" + OUTFILE + "-subsamples/" + OUTFILE + "-subsample{num}.tsv", num=list(range(1, SUBSAMPLES + 1)))
+    output:
+        # expand(OUTDIR + "/" + OUTFILE + "-subsamples/" + OUTFILE + "-results{num}.csv", num=list(range(1, SUBSAMPLES + 1)))
+        OUTDIR + "/" + OUTFILE + "-subsamples/" + OUTFILE + "-results{num}.csv"
+    params:
+        GA = '--codonGA' if FULL_MODEL else ""
+    shell:
+        'python3 {RESULT_PROCESSOR} {params.GA} --ref {NEUTRAL_REF} --GA_result {input} --outfile {output}'
+
+
+rule combine_results:
+    input: expand(OUTDIR + "/" + OUTFILE + "-subsamples/" + OUTFILE + "-results{num}.csv", num=list(range(1, SUBSAMPLES + 1)))
+    output: OUTDIR + "/" + OUTFILE + ".csv"
+    run:
+        with open(OUTDIR + "/" + OUTFILE + ".csv", 'wb') as outfile:
+            for i, fname in enumerate(input):
+                with open(fname, 'rb') as infile:
+                    if i != 0:
+                        infile.readline()  # Throw away header on all but first file
+                    # Block copy rest of file from input to output without parsing
+                    shutil.copyfileobj(infile, outfile)
+
+
+
